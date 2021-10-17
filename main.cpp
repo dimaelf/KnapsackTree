@@ -17,6 +17,7 @@ struct {
     int ElementSize = 64;   ///< Knapsack item size in bits;
     int ProcCount   = 8;    ///< ProcessorCount to emulate/use;
     int IterCount   = 100;  ///< Number of iterations to run;
+    int RelativeTargetWeight   = -1;  ///< Relative target weight of knapsack vector;
     } cfg;
 
 /// Experiment Start Time
@@ -60,15 +61,17 @@ int main(int argc, char* argv[])
     int mode = 0;
     for(int a=1; a<argc; a++)
     {
-        if(mode == 1) {cfg.TaskSize    = atoi(argv[a]); mode = 0; continue;}
-        if(mode == 2) {cfg.ElementSize = atoi(argv[a]); mode = 0; continue;}
-        if(mode == 3) {cfg.ProcCount   = atoi(argv[a]); mode = 0; continue;}
-        if(mode == 4) {cfg.IterCount   = atoi(argv[a]); mode = 0; continue;}
+        if(mode == 1) {cfg.TaskSize             = atoi(argv[a]); mode = 0; continue;}
+        if(mode == 2) {cfg.ElementSize          = atoi(argv[a]); mode = 0; continue;}
+        if(mode == 3) {cfg.ProcCount            = atoi(argv[a]); mode = 0; continue;}
+        if(mode == 4) {cfg.IterCount            = atoi(argv[a]); mode = 0; continue;}
+        if(mode == 5) {cfg.RelativeTargetWeight = atoi(argv[a]); mode = 0; continue;}
 
         if(!strcmp(argv[a],"-n")) {mode = 1; continue;}
         if(!strcmp(argv[a],"-m")) {mode = 2; continue;}
         if(!strcmp(argv[a],"-p")) {mode = 3; continue;}
         if(!strcmp(argv[a],"-i")) {mode = 4; continue;}
+        if(!strcmp(argv[a],"-r")) {mode = 5; continue;}
 
         PrintError(argv[a]);
         return(-1);
@@ -86,12 +89,14 @@ int main(int argc, char* argv[])
            "---> Element size:    %i;\n"
            "---> Processor Count: %i;\n"
            "---> Iteration Count: %i;\n"
-           "---> Codebase Date:   12-10-2018;\n"     // TODO: Codebase date!!!
+           "---> Fixed relative target weight, %: %i;\n"
+           "---> Codebase Date:   17-10-2021;\n"     // TODO: Codebase date!!!
            "---> Experiment Date: %02i-%02i-%4i;\n",
            cfg.TaskSize,
            cfg.ElementSize,
            cfg.ProcCount,
            cfg.IterCount,
+           cfg.RelativeTargetWeight,
            timeinfo->tm_mday,
            timeinfo->tm_mon+1,
            timeinfo->tm_year+1900);
@@ -142,7 +147,11 @@ int main(int argc, char* argv[])
 
     /* Format the output table header */
     printf("ITER   |");
-    printf("RELW, %%|"); for(int j=0; j<cfg.ProcCount; j++) printf("Time,ms|");
+    printf("RELW, %%|");
+#ifdef _DEBUG
+    printf("Weight     |");
+#endif
+    for(int j=0; j<cfg.ProcCount; j++) printf("Time,ms|");
     printf("\n");
     printf("-------x");
     printf("-------x"); for(int j=0; j<cfg.ProcCount; j++) printf("-------x");
@@ -159,18 +168,37 @@ int main(int argc, char* argv[])
         for(int i=0; i<cfg.TaskSize;i++)
             NTL::add(sum_ai, sum_ai, knp.get(i));
 
-        /* Generate a proper non-trivial target weight */
-        w = 0;
-        while((w<=0) || (w>=sum_ai))
-            w = BigRandom(cfg.ElementSize);
-
-        /* Calculate the relative target weight */
         NTL::ZZ relw;
-        relw = w * 100 / sum_ai;
+        if((cfg.RelativeTargetWeight < 0) || (cfg.RelativeTargetWeight > 100))
+        {
+#ifdef _DEBUG
+            if(iter == 0)
+            {
+                printf("Wrong RelativeTargetWeight, using random weight;\n" );
+            }                
+#endif
+            
+            /* Generate a proper non-trivial target weight */
+            w = 0;
+            while((w<=0) || (w>=sum_ai))
+                w = BigRandom(cfg.ElementSize);
+
+            /* Calculate the relative target weight */
+            relw = w * 100 / sum_ai;
+        }
+        else
+        {
+            // Set relative target weight and calculate target weight
+            relw = NTL::ZZ(cfg.RelativeTargetWeight);            
+            w = relw * sum_ai / 100;
+        }
 
         /* Initialize an iteration */
         printf("I:%5i| ", iter);
         printf("%6i| ", NTL::to_uint(relw));
+#ifdef _DEBUG
+        printf("%10u| ", NTL::to_uint(w));
+#endif
         solutions_total = 0;
         nodes_total = 0;
 
@@ -288,10 +316,11 @@ NTL::ZZ BigRandom(int bits)
 void PrintHelp()
 {
     printf("Command line switches:\n"
-           "   -n [number]: Set task size (number of items);   def:  24\n"
-           "   -m [number]: Set element size (in bits);        def:  64\n"
-           "   -p [number]: Set processor count;               def:   8\n"
-           "   -i [number]: Set iterations count;              def: 100\n");
+           "   -n [number]: Set task size (number of items);                    def:  24\n"
+           "   -m [number]: Set element size (in bits);                         def:  64\n"
+           "   -p [number]: Set processor count;                                def:   8\n"
+           "   -i [number]: Set iterations count;                               def: 100\n"
+           "   -r [number]: Set relative target weight of knapsack vector, %;   undef\n");
     return;
 }
 
