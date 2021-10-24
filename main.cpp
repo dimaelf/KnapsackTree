@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <math.h>
+#include <algorithm>
 
 #include <NTL/RR.h>
 
@@ -13,12 +14,13 @@
 
 /// The structure holding the parameters of the current experiment
 struct {
-    int TaskSize    = 24;   ///< Task size (number of Knapsack items);
-    int ElementSize = 64;   ///< Knapsack item size in bits;
-    int ProcCount   = 8;    ///< ProcessorCount to emulate/use;
-    int IterCount   = 100;  ///< Number of iterations to run;
-    int RelativeTargetWeight   = -1;  ///< Relative target weight of knapsack vector;
-    } cfg;
+    int TaskSize                = 24;   ///< Task size (number of Knapsack items);
+    int ElementSize             = 64;   ///< Knapsack item size in bits;
+    int ProcCount               = 8;    ///< ProcessorCount to emulate/use;
+    int IterCount               = 100;  ///< Number of iterations to run;
+    int RelativeTargetWeight    = -1;  ///< Relative target weight of knapsack vector;
+    bool OptimizedAlgorithm     = false; ///< Use optimized version of algorithm
+} cfg;
 
 /// Experiment Start Time
 time_t rawtime;
@@ -47,6 +49,73 @@ void PrintError(char* arg);
 /// @return Node count for this subtree;
 NTL::ZZ WeighBranch(int ts, NTL::vec_GF2 mask);
 
+#ifdef _DEBUG
+#define PrintPCKDebug(pck, msg) do { PrintPCK(pck, msg); } while (0)
+
+void PrintPCK(NTL::vec_GF2 pck, const char* msg)
+{
+    if (msg != nullptr)
+    {
+        printf("%s: \n", msg);
+    }
+
+    for (auto i: pck)
+    {
+        printf("%u", i==1 ? 1 : 0);
+    }
+    printf("\n");
+}
+
+#else
+#define PrintPCKDebug(pck, msg) do { } while (0)
+#endif
+
+#define GoSide(knp, pck, c) \
+do { \
+    PrintPCKDebug(pck, "GoSide"); \
+    for (auto i = cfg.TaskSize-1; i >= 0; i--) \
+    { \
+        if (pck.get(i) == 1) \
+        { \
+            pck.put(i, 0); \
+            NTL::add(c, c, -knp.get(i)); \
+            pck.put(i+1, 1); \
+            NTL::add(c, c, knp.get(i+1)); \
+            break; \
+        } \
+    } \
+    PrintPCKDebug(pck, nullptr); \
+} while (0)
+
+#define GoBack(knp, pck, c) \
+do { \
+    PrintPCKDebug(pck, "GoBack"); \
+    pck.put(cfg.TaskSize-1, 0); \
+    NTL::add(c, c, -knp.get(cfg.TaskSize-1)); \
+    PrintPCKDebug(pck, nullptr); \
+    GoSide(knp, pck, c); \
+} while (0)
+
+#define GoForward(knp, pck, c) \
+do { \
+    PrintPCKDebug(pck, "GoForward"); \
+    for (auto i = cfg.TaskSize-1; i >= 0; i--) \
+    { \
+        if (pck.get(i) == 1) \
+        { \
+            pck.put(i+1, 1); \
+            NTL::add(c, c, knp.get(i+1)); \
+            break; \
+        } \
+        if (i == 0) \
+        { \
+            pck.put(0, 1); \
+            NTL::add(c, c, knp.get(0)); \
+        } \
+    } \
+    PrintPCKDebug(pck, nullptr); \
+} while (0)
+
 int main(int argc, char* argv[])
 {
     /* Print the boilerplate */
@@ -73,6 +142,8 @@ int main(int argc, char* argv[])
         if(!strcmp(argv[a],"-i")) {mode = 4; continue;}
         if(!strcmp(argv[a],"-r")) {mode = 5; continue;}
 
+        if(!strcmp(argv[a],"-o")) {cfg.OptimizedAlgorithm = true; mode = 0; continue;}
+
         PrintError(argv[a]);
         return(-1);
     }
@@ -89,13 +160,15 @@ int main(int argc, char* argv[])
            "---> Element size:    %i;\n"
            "---> Processor Count: %i;\n"
            "---> Iteration Count: %i;\n"
+           "---> Using optimized algorithm: %s;\n"
            "---> Fixed relative target weight, %: %i;\n"
-           "---> Codebase Date:   17-10-2021;\n"     // TODO: Codebase date!!!
+           "---> Codebase Date:   25-10-2021;\n"
            "---> Experiment Date: %02i-%02i-%4i;\n",
            cfg.TaskSize,
            cfg.ElementSize,
            cfg.ProcCount,
            cfg.IterCount,
+           cfg.OptimizedAlgorithm ? "Yes" : "No",
            cfg.RelativeTargetWeight,
            timeinfo->tm_mday,
            timeinfo->tm_mon+1,
@@ -110,7 +183,6 @@ int main(int argc, char* argv[])
             printf("Experiment build: Unknown;\n\n" );
         #endif
     #endif
-
 
     /* Definition of the Knapsack Problem */
     NTL::vec_ZZ  knp;   //< The Knapsack vector (item weights);
@@ -128,19 +200,6 @@ int main(int argc, char* argv[])
     knp.SetLength(cfg.TaskSize,NTL::ZZ(0));  //< Initialize the Knapsack vector;
     pck.SetLength(cfg.TaskSize,NTL::GF2(0)); //< Initialize a packing vector;
 
-    /// @section Linearization
-    /// First, we have to do some precalculations for the linearization
-    /// routines. The functions used here split the original tree into 8
-    /// subtrees. Whenever tree size gets too small, it needs to split into
-    /// 4 or 2 subtrees, too. The order of subtrees is known, so is their size.
-    /// Therefore, at preliminary stage we calculate where each of the trees
-    /// starts and build the static Domain Size Cache with this data.
-    ///
-    /// As soon as the initialization is done the pair of functions
-    /// GetLiteralStringByNumber() and SetMaskByLiteralString() may be
-    /// used to translate packing numbers into packing vectors, and
-    /// and GetLiteralStringByMask() and GetNumberByLiteralString()
-    /// to translate packing vectors into their respective numbers;
     DomainType* lit = (DomainType*)malloc((unsigned long)((cfg.TaskSize/3+3) *
                       sizeof(DomainType)));
     InitializeDomainSizeCache(cfg.TaskSize);
@@ -148,9 +207,6 @@ int main(int argc, char* argv[])
     /* Format the output table header */
     printf("ITER   |");
     printf("RELW, %%|");
-#ifdef _DEBUG
-    printf("Weight     |");
-#endif
     for(int j=0; j<cfg.ProcCount; j++) printf("Time,ms|");
     printf("\n");
     printf("-------x");
@@ -163,6 +219,12 @@ int main(int argc, char* argv[])
         for(int j=0; j<cfg.TaskSize; j++)
             knp[j] = BigRandom(cfg.ElementSize - ceil( log(cfg.TaskSize)/log(2) ));
 
+        if(cfg.OptimizedAlgorithm == true)
+        {
+            // Sort descending knapsack vector
+            std::sort(knp.begin(), knp.end(), std::greater<NTL::ZZ>());
+        }
+
         /* Get the sum of all Knapsack elements */
         NTL::ZZ sum_ai = NTL::ZZ(0);
         for(int i=0; i<cfg.TaskSize;i++)
@@ -170,14 +232,7 @@ int main(int argc, char* argv[])
 
         NTL::ZZ relw;
         if((cfg.RelativeTargetWeight < 0) || (cfg.RelativeTargetWeight > 100))
-        {
-#ifdef _DEBUG
-            if(iter == 0)
-            {
-                printf("Wrong RelativeTargetWeight, using random weight;\n" );
-            }                
-#endif
-            
+        {            
             /* Generate a proper non-trivial target weight */
             w = 0;
             while((w<=0) || (w>=sum_ai))
@@ -193,12 +248,17 @@ int main(int argc, char* argv[])
             w = relw * sum_ai / 100;
         }
 
+        if(cfg.OptimizedAlgorithm == true)
+        {
+            if(2 * w > sum_ai)
+            {
+                w = sum_ai - w;
+            }
+        }
+
         /* Initialize an iteration */
         printf("I:%5i| ", iter);
         printf("%6i| ", NTL::to_uint(relw));
-#ifdef _DEBUG
-        printf("%10u| ", NTL::to_uint(w));
-#endif
         solutions_total = 0;
         nodes_total = 0;
 
@@ -207,13 +267,6 @@ int main(int argc, char* argv[])
         {
             /* Start the experiment clock */
             clck = clock();
-
-            /// @section LoadBalancing Load Balancing
-            /// Here we must split the task into (n) subtasks for each of the
-            /// processors. Our input data is the number of processors (P) and
-            /// the number of the current processor (ProcRank). We must generate
-            /// and return the (ProcRank)-th subtask. Here we need to provide
-            /// the first and the last packing number in the work area.
 
             /* Count the nodes in subtasks */
             NTL::ZZ InitialFragSize;
@@ -235,58 +288,96 @@ int main(int argc, char* argv[])
             /* Reset weight buffer */
             c = 0;
 
-            /* Start the search */
-            while (CurrentNode <= frag_end)
+            if (cfg.OptimizedAlgorithm == true)
             {
-                /// @section PackingVectorGeneration In this variation of the
-                /// algorithm we every time construct the packing vector
-                /// by its number, thus always invoking the linearization
-                /// routine. This is clearly suboptimal.
                 GetLiteralStringByNumber(cfg.TaskSize, lit, CurrentNode);
                 SetMaskByLiteralString(cfg.TaskSize, &pck, lit);
 
-                /// @section GettingPackingWeight Getting the Packing Weight
-                /// Here we must calculate the weight (c) of the packing (pck)
-                /// we have just generated. Here we can choose to use addition
-                /// or multiplication modulo m, as well as calculate the weight
-                /// (c) from scratch or using the previous value.
-                c = 0;
                 for (int i = cfg.TaskSize-1; i>=0; i--)
                     if(pck.get(i)==1)
                     {
                         NTL::add(c, c, knp.get(i));
-                        //NTL::mul(c, c, knp.get(i));
-                        //NTL::AddMod(c,c,k.knp.get(i));
-                        //NTL::MulMod(c,c,k.knp.get(i));
                     };
+            }
 
-                /// @section NodeProcessing Processing a Node
-                /// Here we do everything we need to with the current packing.
-                /// The order of the operations matter: the most common outcome
-                /// should be the first to avoid excessive ifs. If the node is
-                /// deficient (the weight is too low) then we just advance to
-                /// the next node. If the node is excessive (too much weight)
-                /// we determine the size of the branch we cut and advance the
-                /// current node number by as much. If the node is a solution,
-                /// we do the same, but also any solution processing we need.
-                //nodes_total++;
+            /* Start the search */
+            while (CurrentNode <= frag_end)
+            {
+                if(cfg.OptimizedAlgorithm == false)
+                {
+                    GetLiteralStringByNumber(cfg.TaskSize, lit, CurrentNode);
+                    SetMaskByLiteralString(cfg.TaskSize, &pck, lit);
+
+                    c = 0;
+                    for (int i = cfg.TaskSize-1; i>=0; i--)
+                        if(pck.get(i)==1)
+                        {
+                            NTL::add(c, c, knp.get(i));
+                        };
+                }
+
                 if(c < w)
                 {
                     CurrentNode++;
-                    current_pool--;
+
+                    if (cfg.OptimizedAlgorithm == true)
+                    {
+                        if (pck[cfg.TaskSize-1] == 1)
+                        {
+                            GoBack(knp, pck, c);
+                        }
+                        else
+                        {
+                            GoForward(knp, pck, c);
+                        }
+                    }
+                    else
+                    {
+                        current_pool--;
+                    }
                 }
                 else if(c > w)
                 {
                     branch_size = WeighBranch(cfg.TaskSize, pck);
-                    current_pool -= branch_size;
                     CurrentNode += branch_size;
+
+                    if (cfg.OptimizedAlgorithm == true)
+                    {
+                        if (pck[cfg.TaskSize-1] == 1)
+                        {
+                            GoBack(knp, pck, c);
+                        }
+                        else
+                        {
+                            GoSide(knp, pck, c);
+                        }
+                    }
+                    else
+                    {
+                        current_pool -= branch_size;
+                    }
                 }
                 else if(c == w)
                 {
                     solutions_total++;
                     branch_size = WeighBranch(cfg.TaskSize, pck);
-                    current_pool -= branch_size;
                     CurrentNode += branch_size;
+
+                    if(cfg.OptimizedAlgorithm == true)
+                    {
+                        if (pck[cfg.TaskSize-1] == 1)
+                        {
+                            GoBack(knp, pck, c);
+                        }
+                        else
+                        {
+                            GoSide(knp, pck, c);
+                        }
+                    }
+                    else
+                    {
+                        current_pool -= branch_size;   
+                    }
                 }
 
             }
@@ -301,7 +392,7 @@ int main(int argc, char* argv[])
         printf("\n");
     }
 
-    return(0);
+    return 0;
 }
 
 NTL::ZZ BigRandom(int bits)
@@ -320,7 +411,8 @@ void PrintHelp()
            "   -m [number]: Set element size (in bits);                         def:  64\n"
            "   -p [number]: Set processor count;                                def:   8\n"
            "   -i [number]: Set iterations count;                               def: 100\n"
-           "   -r [number]: Set relative target weight of knapsack vector, %;   undef\n");
+           "   -r [number]: Set relative target weight of knapsack vector, %;   undef\n"
+           "   -o         : Use optimized algorithm\n");
     return;
 }
 
